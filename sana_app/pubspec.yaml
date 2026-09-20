@@ -45,7 +45,7 @@ dependencies:
   tflite_flutter: ^0.12.1
   geolocator: ^14.0.2
   network_info_plus: ^7.0.0
-  permission_handler: ^13.0.1
+  permission_handler: 11.3.1
   shared_preferences: ^2.5.5
 
 dev_dependencies:
