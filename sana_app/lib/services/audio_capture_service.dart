@@ -23,9 +23,15 @@ class AudioCaptureService {
   Timer? _simulationTimer;
 
   bool _isListening = false;
-  double rmsGateThreshold = AppConstants.defaultRmsGateThreshold;
+  double rmsGateThreshold = 0.015; // Responsive threshold
   OnDetectionCallback? onDetection;
   OnRmsUpdateCallback? onRmsUpdate;
+
+  // Rolling Ring Buffer (15,600 samples = 0.975s @ 16kHz)
+  static const int _targetSampleCount = 15600;
+  final List<double> _rollingAudioBuffer = List<double>.filled(_targetSampleCount, 0.0);
+  int _bufferWriteIndex = 0;
+  DateTime _lastInferenceTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   AudioCaptureService._internal();
 
@@ -52,27 +58,29 @@ class AudioCaptureService {
           ),
         );
 
-        final List<int> pcmBuffer = [];
-        // Window size for 0.975s at 16kHz = 15600 samples * 2 bytes = 31200 bytes
-        const targetByteCount = 31200;
-
         _audioStreamSub = stream.listen((chunk) {
-          pcmBuffer.addAll(chunk);
+          if (!_isListening) return;
 
-          // Calculate instant RMS
-          final rms = _calculateRmsFromBytes(chunk);
-          onRmsUpdate?.call(rms);
+          final sampleCount = chunk.length ~/ 2;
+          final byteData = ByteData.sublistView(Uint8List.fromList(chunk));
+          double sumSquares = 0.0;
 
-          if (pcmBuffer.length >= targetByteCount) {
-            final windowBytes = pcmBuffer.sublist(0, targetByteCount);
-            pcmBuffer.removeRange(0, (targetByteCount * 0.5).toInt()); // 50% overlap
+          // Ingest incoming PCM chunk into rolling ring buffer
+          for (int i = 0; i < sampleCount; i++) {
+            final sample = byteData.getInt16(i * 2, Endian.little) / 32768.0;
+            _rollingAudioBuffer[_bufferWriteIndex] = sample;
+            _bufferWriteIndex = (_bufferWriteIndex + 1) % _targetSampleCount;
+            sumSquares += sample * sample;
+          }
 
-            final double windowRms = _calculateRmsFromBytes(windowBytes);
+          final instantRms = sqrt(sumSquares / (sampleCount > 0 ? sampleCount : 1));
+          onRmsUpdate?.call(instantRms);
 
-            // Energy Gating: Skip inference if sound energy is below RMS threshold
-            if (windowRms >= rmsGateThreshold) {
-              _processAudioWindow(windowBytes);
-            }
+          // Fast Energy Trigger: if RMS exceeds gate and 350ms cooldown has elapsed
+          final now = DateTime.now();
+          if (instantRms >= rmsGateThreshold && now.difference(_lastInferenceTime).inMilliseconds > 350) {
+            _lastInferenceTime = now;
+            _dispatchInference();
           }
         });
       } catch (_) {
@@ -81,6 +89,23 @@ class AudioCaptureService {
     } else {
       _startSimulatedStream();
     }
+  }
+
+  void _dispatchInference() async {
+    // Reconstruct ordered 15,600 samples from ring buffer
+    final List<double> orderedBuffer = List<double>.filled(_targetSampleCount, 0.0);
+    for (int i = 0; i < _targetSampleCount; i++) {
+      orderedBuffer[i] = _rollingAudioBuffer[(_bufferWriteIndex + i) % _targetSampleCount];
+    }
+
+    final prediction = await ClassifierService.instance.classify(orderedBuffer);
+    
+    // Ignore ambient quiet noise from creating disruptive alerts
+    if (prediction.label == "Ambient / Background Noise" && prediction.confidence < 0.70) {
+      return;
+    }
+
+    await _handlePrediction(prediction);
   }
 
   void _startSimulatedStream() {
@@ -94,34 +119,6 @@ class AudioCaptureService {
         _processSimulatedDetection();
       }
     });
-  }
-
-  double _calculateRmsFromBytes(List<int> bytes) {
-    if (bytes.isEmpty) return 0.0;
-    double sum = 0.0;
-    int count = bytes.length ~/ 2;
-    final byteData = ByteData.sublistView(Uint8List.fromList(bytes));
-
-    for (int i = 0; i < count; i++) {
-      int sample = byteData.getInt16(i * 2, Endian.little);
-      double normalized = sample / 32768.0;
-      sum += normalized * normalized;
-    }
-
-    return sqrt(sum / (count > 0 ? count : 1));
-  }
-
-  Future<void> _processAudioWindow(List<int> windowBytes) async {
-    final int sampleCount = windowBytes.length ~/ 2;
-    final byteData = ByteData.sublistView(Uint8List.fromList(windowBytes));
-    final List<double> floatBuffer = List.filled(sampleCount, 0.0);
-
-    for (int i = 0; i < sampleCount; i++) {
-      floatBuffer[i] = byteData.getInt16(i * 2, Endian.little) / 32768.0;
-    }
-
-    final prediction = await ClassifierService.instance.classify(floatBuffer);
-    await _handlePrediction(prediction);
   }
 
   Future<void> _processSimulatedDetection([String? manualClass]) async {
